@@ -1,0 +1,90 @@
+# デプロイメント制御とバリデーション
+# 機能:
+#   1. DEPLOY_FLG を判定（true/false）
+#      - deploy_enabled output を設定
+#      - false の場合、以降の AWS/CodeBuild ステップをスキップ
+#   2. DEPLOY_FLG=true の場合のみ、必須設定をチェック
+#      - 不足している設定があれば失敗
+# これにより、DEPLOY_FLG=false で安全にデプロイを中断できる
+
+name: Validate and Gate Deployment
+description: DEPLOY_FLG を判定し、必須設定をチェック
+
+inputs:
+  aws_account_id:
+    description: AWS Account ID secret
+    required: false
+  aws_access_key_id:
+    description: AWS Access Key ID secret
+    required: false
+  aws_secret_access_key:
+    description: AWS Secret Access Key secret
+    required: false
+
+outputs:
+  deploy_enabled:
+    description: Whether deployment is enabled (true/false)
+    value: ${{ steps.gate.outputs.deploy_enabled }}
+
+runs:
+  using: composite
+  steps:
+    - name: Evaluate DEPLOY_FLG
+      id: gate
+      shell: bash
+      run: |
+        # DEPLOY_FLG の値を正規化（true/TRUE/True などの表記ゆれに対応）
+        DEPLOY_FLG_NORMALIZED="$(echo "${DEPLOY_FLG:-false}" | tr '[:upper:]' '[:lower:]')"
+        echo "DEPLOY_FLG (raw)       : ${DEPLOY_FLG:-false}"
+        echo "DEPLOY_FLG (normalized): $DEPLOY_FLG_NORMALIZED"
+
+        # deploy_enabled フラグを設定（以降のステップでこれを使って制御）
+        if [[ "$DEPLOY_FLG_NORMALIZED" == "true" ]]; then
+          echo "deploy_enabled=true" >> "$GITHUB_OUTPUT"
+          echo "CD is enabled."
+        else
+          echo "deploy_enabled=false" >> "$GITHUB_OUTPUT"
+          echo "CD is disabled by DEPLOY_FLG. Skipping AWS/CodeBuild/Slack steps."
+        fi
+
+    - name: Validate required settings
+      if: steps.gate.outputs.deploy_enabled == 'true'
+      shell: bash
+      env:
+        AWS_ACCOUNT_ID: ${{ inputs.aws_account_id }}
+        AWS_ACCESS_KEY_ID: ${{ inputs.aws_access_key_id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.aws_secret_access_key }}
+      run: |
+        # DEPLOY_FLG=true の場合のみ、CodeBuild実行に必要な設定をチェック
+        # 必須設定が不足していれば、ここで失敗して以降のステップをスキップ
+        MISSING=0
+
+        # 設定の存在をチェックする関数
+        require_var() {
+          local key="$1"
+          local value="$2"
+          if [[ -z "$value" ]]; then
+            echo "Missing required setting: $key"
+            MISSING=1
+          fi
+        }
+
+        # CodeBuild実行に必要な環境設定
+        require_var "AWS_REGION" "$AWS_REGION"
+        require_var "CODEBUILD_PROJECT_NAME" "$CODEBUILD_PROJECT_NAME"
+        require_var "ECR_CONTAINER_NAME" "$ECR_CONTAINER_NAME"
+        require_var "ECS_SERVICE" "$ECS_SERVICE"
+        require_var "ECS_CLUSTER_NAME" "$ECS_CLUSTER_NAME"
+        
+        # AWS認証に必要なシークレット
+        require_var "AWS_ACCOUNT_ID (secret)" "$AWS_ACCOUNT_ID"
+        require_var "AWS_ACCESS_KEY_ID (secret)" "$AWS_ACCESS_KEY_ID"
+        require_var "AWS_SECRET_ACCESS_KEY (secret)" "$AWS_SECRET_ACCESS_KEY"
+
+        # 不足している設定があれば失敗
+        if [[ "$MISSING" -ne 0 ]]; then
+          echo "Required settings validation failed."
+          exit 1
+        fi
+
+        echo "Required settings validation passed."

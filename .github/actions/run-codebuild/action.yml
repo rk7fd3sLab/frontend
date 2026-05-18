@@ -1,0 +1,154 @@
+# CodeBuild ジョブ実行・監視アクション
+# 機能:
+#   1. RELEASE_TAG と SOURCE_VERSION を git event から決定
+#      - タグpush: タグ名をそのまま使用
+#      - release/*: release-* 形式
+#      - develop: sha-XXXXXXX 形式
+#   2. CodeBuild プロジェクトを起動
+#   3. ポーリングでビルド完了を監視（15秒間隔）
+#   4. 完了時に build_id と logs_link を出力
+
+name: Run CodeBuild and wait for result
+description: CodeBuild ジョブを実行して完了まで監視
+
+inputs:
+  github_sha:
+    description: GitHub SHA
+    required: true
+  github_ref:
+    description: GitHub ref
+    required: true
+  github_ref_name:
+    description: GitHub ref name
+    required: true
+  deploy_env:
+    description: Deployment environment
+    required: true
+  aws_account_id:
+    description: AWS Account ID
+    required: true
+  aws_region:
+    description: AWS Region
+    required: true
+  codebuild_project_name:
+    description: CodeBuild project name
+    required: true
+  ecr_container_name:
+    description: ECR container name
+    required: true
+  ecs_service:
+    description: ECS service name
+    required: true
+  ecs_cluster_name:
+    description: ECS cluster name
+    required: true
+
+outputs:
+  build_id:
+    description: CodeBuild build ID
+    value: ${{ steps.codebuild.outputs.build_id }}
+  logs_link:
+    description: CodeBuild logs link
+    value: ${{ steps.codebuild.outputs.logs_link }}
+
+runs:
+  using: composite
+  steps:
+    - name: Start CodeBuild and wait for result
+      id: codebuild
+      shell: bash
+      env:
+        GITHUB_SHA: ${{ inputs.github_sha }}
+        GITHUB_REF: ${{ inputs.github_ref }}
+        GITHUB_REF_NAME: ${{ inputs.github_ref_name }}
+        DEPLOY_ENV: ${{ inputs.deploy_env }}
+        AWS_ACCOUNT_ID: ${{ inputs.aws_account_id }}
+        AWS_REGION: ${{ inputs.aws_region }}
+        CODEBUILD_PROJECT_NAME: ${{ inputs.codebuild_project_name }}
+        ECR_CONTAINER_NAME: ${{ inputs.ecr_container_name }}
+        ECS_SERVICE: ${{ inputs.ecs_service }}
+        ECS_CLUSTER_NAME: ${{ inputs.ecs_cluster_name }}
+      run: |
+        # イベント種別に応じて SOURCE_VERSION と RELEASE_TAG を決定
+        # - タグpush: タグ名をそのまま使用
+        # - release/*: release-<branch_name> 形式でタグ付け
+        # - develop: sha-<short_sha> 形式
+        if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          RELEASE_TAG_VALUE="$GITHUB_REF_NAME"
+          SOURCE_VERSION="refs/tags/$GITHUB_REF_NAME"
+        elif [[ "$GITHUB_REF" == refs/heads/release/* ]]; then
+          RELEASE_TAG_VALUE="release-$GITHUB_REF_NAME"
+          SOURCE_VERSION="refs/heads/$GITHUB_REF_NAME"
+        else
+          RELEASE_TAG_VALUE=sha-$(echo "$GITHUB_SHA" | cut -c1-7)
+          SOURCE_VERSION="refs/heads/$GITHUB_REF_NAME"
+        fi
+
+        echo "ref_type=${{ github.ref_type }}, RELEASE_TAG_VALUE=$RELEASE_TAG_VALUE, SOURCE_VERSION=$SOURCE_VERSION"
+
+        # デバッグ用: 実行環境情報を表示
+        echo "============================================"
+        echo "Determined Environment: DEPLOY_ENV=$DEPLOY_ENV"
+        echo "Event: ${{ github.event_name }}, Ref: $GITHUB_REF"
+        echo "============================================"
+
+        # CodeBuild に環境変数を明示的に渡す
+        # プロジェクト側の既定値に依存しないため、環境差分に強い
+        BUILD_ID=$(aws codebuild start-build \
+          --source-version $SOURCE_VERSION \
+          --project-name $CODEBUILD_PROJECT_NAME \
+          --region $AWS_REGION \
+          --no-report-build-status-override \
+          --environment-variables-override \
+            name=DEPLOY_ENV,value=$DEPLOY_ENV,type=PLAINTEXT \
+            name=RELEASE_TAG,value=$RELEASE_TAG_VALUE,type=PLAINTEXT \
+            name=AWS_ACCOUNT_ID,value=$AWS_ACCOUNT_ID,type=PLAINTEXT \
+            name=AWS_REGION,value=$AWS_REGION,type=PLAINTEXT \
+            name=ECR_CONTAINER_NAME,value=$ECR_CONTAINER_NAME,type=PLAINTEXT \
+            name=ECS_SERVICE,value=$ECS_SERVICE,type=PLAINTEXT \
+            name=ECS_CLUSTER_NAME,value=$ECS_CLUSTER_NAME,type=PLAINTEXT \
+          --query 'build.id' \
+          --output text)
+
+        echo "Started CodeBuild: $BUILD_ID"
+        echo "build_id=$BUILD_ID" >> "$GITHUB_OUTPUT"
+
+        # CodeBuild のビルド完了をポーリングで監視（15秒間隔）
+        # SUCCEEDED が返るまで待機、または FAILED/FAULT/TIMED_OUT/STOPPED で失敗
+        while true; do
+          BUILD_STATUS=$(aws codebuild batch-get-builds --ids "$BUILD_ID" --query 'builds[0].buildStatus' --output text)
+          LOGS_LINK=$(aws codebuild batch-get-builds --ids "$BUILD_ID" --query 'builds[0].logs.deepLink' --output text)
+          echo "CodeBuild status: $BUILD_STATUS"
+          
+          # ログリンクが取得できれば表示（デバッグ用）
+          if [ -n "$LOGS_LINK" ] && [ "$LOGS_LINK" != "None" ]; then
+            echo "CodeBuild logs: $LOGS_LINK"
+          fi
+
+          # ログリンクを step output に保存（Slack通知などで使用）
+          if [ -n "$LOGS_LINK" ] && [ "$LOGS_LINK" != "None" ]; then
+            echo "logs_link=$LOGS_LINK" >> "$GITHUB_OUTPUT"
+          fi
+
+          case "$BUILD_STATUS" in
+            SUCCEEDED)
+              # ビルド成功 - ループを抜ける
+              break
+              ;;
+            FAILED|FAULT|TIMED_OUT|STOPPED)
+              # ビルド失敗 - フェーズ情報を表示して失敗
+              echo "CodeBuild failed with status: $BUILD_STATUS"
+              aws codebuild batch-get-builds --ids "$BUILD_ID" --query 'builds[0].phases[].{phase:phaseType,status:phaseStatus,contexts:contexts}' --output table || true
+              exit 1
+              ;;
+            IN_PROGRESS|QUEUED)
+              # ビルド実行中/キュー中 - 15秒待機して再確認
+              sleep 15
+              ;;
+            *)
+              # 予期しないステータス - 待機
+              echo "Unexpected status: $BUILD_STATUS"
+              sleep 15
+              ;;
+          esac
+        done
