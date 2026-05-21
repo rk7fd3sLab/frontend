@@ -4,6 +4,8 @@ Next.js 16 で構成した社内備品貸出ポータルです。
 
 > AWS 上への公開手順（CloudFormation / ECS / CodeBuild を使った構築手順）は、[cicd_iacリポジトリ](../../../cicd_iac) を参照してください。
 
+> frontend と backend は別のサービスを立ち上げる前提となっています。frontend と backend を 1 つのサービスで実現する構成は、single_service ブランチを参照してください。
+
 ## ローカル起動
 
 ### 開発モード
@@ -131,7 +133,7 @@ Variables（Environment 単位で上書き可）:
 - ECS クラスター
 	- 例: `ecs-cluster`
 - ECS サービス
-	- 例: `webapp-task-service`
+	- 例: `frontend-task-service`
 - CodeBuild プロジェクト
 	- 例: `frontend-build-deploy`
 	- `buildspec.yml` は frontend 配下のものを利用
